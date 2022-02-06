@@ -1,7 +1,11 @@
 use dialoguer::Input;
-use indicatif::ProgressIterator;
-use rand::seq::SliceRandom;
-use std::{collections::HashMap, fs::OpenOptions, io::Write};
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    hash::{Hash, Hasher},
+    io::Write,
+    sync::Mutex,
+};
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -31,8 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .append(true)
                 .create(true)
                 .open("stats.txt")?;
-            loop {
-                let secret = all_words.choose(&mut rand::thread_rng()).unwrap();
+
+            for secret in &all_words {
                 let mut guesses = Vec::new();
                 let word = play_game(&all_words, |guess| {
                     guesses.push(guess.to_string());
@@ -42,9 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 guesses.push(word.to_string());
                 assert_eq!(&word, secret);
 
-                writeln!(&mut file, "{},{:?}", secret, guesses)?;
-                eprintln!("{},{:?}", secret, guesses);
+                writeln!(&mut file, "{};{:?}", secret, guesses)?;
+                eprintln!("{};{:?}", secret, guesses);
             }
+            Ok(())
         }
     }
 }
@@ -53,18 +58,39 @@ fn play_game<'s>(words: &[&'s str], mut get_outcome: impl FnMut(&str) -> Vec<Out
     let mut possible_words = words.to_vec();
 
     while possible_words.len() > 1 {
-        let guess = calc_guess_word(&possible_words, words);
-        let outcome = get_outcome(guess);
-        possible_words = filter_words(&possible_words, guess, outcome);
+        let guess = get_guess_word(&possible_words, words);
+        let outcome = get_outcome(&guess);
+        possible_words = filter_words(&possible_words, &guess, outcome);
     }
     possible_words.pop().unwrap()
 }
 
-fn calc_guess_word<'s>(possible_words: &[&str], guessable_words: &[&'s str]) -> &'s str {
+lazy_static::lazy_static! {
+    static ref START_CACHE: Mutex<HashMap<u64, String>> = Mutex::new(HashMap::new());
+}
+
+fn get_guess_word<'s>(possible: &[&str], guessable: &[&'s str]) -> String {
+    if possible != guessable {
+        return calc_guess_word(possible, guessable);
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::default();
+    guessable.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let mut cache_lock = START_CACHE.lock().unwrap();
+    cache_lock
+        .entry(hash)
+        .or_insert_with(|| calc_guess_word(possible, guessable).to_string())
+        .to_string()
+}
+
+fn calc_guess_word<'s>(possible_words: &[&str], guessable_words: &[&'s str]) -> String {
     guessable_words
         .iter()
         .min_by_key(|guessed_word| worst_bucket_size(guessed_word, possible_words))
         .unwrap()
+        .to_string()
 }
 
 fn worst_bucket_size(guessed_word: &str, list: &[&str]) -> usize {

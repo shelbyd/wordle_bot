@@ -8,5 +8,6 @@ edition = "2021"
 [dependencies]
 dialoguer = "0.9.0"
 indicatif = "0.16.2"
+lazy_static = "1.4.0"
 rand = "0.8.4"
 structopt = "0.3.26"
