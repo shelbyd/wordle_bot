@@ -1,6 +1,8 @@
 use dialoguer::Input;
+use indicatif::{ParallelProgressIterator, ProgressBar};
+use rayon::iter::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::OpenOptions,
     hash::{Hash, Hasher},
     io::Write,
@@ -9,19 +11,48 @@ use std::{
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
+struct Options {
+    #[structopt(long, default_value = "bonus_guessable.txt")]
+    guessable_words: String,
+
+    #[structopt(long, default_value = "wordlist.txt")]
+    possible_words: String,
+
+    #[structopt(subcommand)]
+    command: Command,
+}
+
+#[derive(StructOpt)]
 enum Command {
     Play,
-    GenStats,
+
+    PlayAll {
+        #[structopt(long, default_value = "all_plays.txt")]
+        out: String,
+    },
+}
+
+lazy_static::lazy_static! {
+    static ref START_CACHE: Mutex<lru::LruCache<u64, String>> = Mutex::new(lru::LruCache::new(1_000));
+    static ref MAX_POSSIBLE: Mutex<Option<usize>> = Mutex::new(None);
+
+    static ref PROGRESS_LOCK: Mutex<()> = Mutex::new(());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let file_contents = std::fs::read_to_string("wordlist.txt")?;
-    let all_words = file_contents.lines().collect::<Vec<_>>();
-    let command = Command::from_args();
+    let options = Options::from_args();
 
-    match command {
+    let possible_contents = std::fs::read_to_string(&options.possible_words)?;
+    let possible_words = possible_contents.lines().collect::<Vec<_>>();
+
+    let guessable_contents = std::fs::read_to_string(&options.guessable_words)?;
+    let mut guessable_words = guessable_contents.lines().collect::<HashSet<_>>();
+    guessable_words.extend(&possible_words);
+    let guessable_words = guessable_words.into_iter().collect::<Vec<_>>();
+
+    match options.command {
         Command::Play => loop {
-            let word = play_game(&all_words, |guess| {
+            let word = play_game(&possible_words, &guessable_words, |guess| {
                 let outcome_str: String = Input::new()
                     .with_prompt(format!("Outcome of '{}'?", guess))
                     .interact_text()
@@ -30,64 +61,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             println!("Word is: '{}'", word);
         },
-        Command::GenStats => {
-            let mut file = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open("stats.txt")?;
+        Command::PlayAll { out } => {
+            let mut file = OpenOptions::new().append(true).create(true).open(&out)?;
 
-            for secret in &all_words {
-                let mut guesses = Vec::new();
-                let word = play_game(&all_words, |guess| {
-                    guesses.push(guess.to_string());
-                    get_outcome(guess, secret)
-                });
+            possible_words
+                .par_iter()
+                .progress_with(if let Ok(_) = PROGRESS_LOCK.try_lock() {
+                    ProgressBar::new(possible_words.len() as u64)
+                } else {
+                    ProgressBar::hidden()
+                })
+                .map(|secret| {
+                    let mut guesses = Vec::new();
+                    let word = play_game(&possible_words, &guessable_words, |guess| {
+                        guesses.push(guess.to_string());
+                        get_outcome(guess, secret)
+                    });
 
-                guesses.push(word.to_string());
-                assert_eq!(&word, secret);
-
-                writeln!(&mut file, "{};{:?}", secret, guesses)?;
-                eprintln!("{};{:?}", secret, guesses);
-            }
+                    guesses.push(word.to_string());
+                    assert_eq!(&word, secret);
+                    (secret, guesses)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .try_for_each(|(secret, guesses)| {
+                    writeln!(&mut file, "{};{:?}", secret, guesses)
+                })?;
             Ok(())
         }
     }
 }
 
-fn play_game<'s>(words: &[&'s str], mut get_outcome: impl FnMut(&str) -> Vec<Outcome>) -> &'s str {
-    let mut possible_words = words.to_vec();
+fn play_game<'s>(
+    possible_words: &[&'s str],
+    guessable_words: &[&str],
+    mut get_outcome: impl FnMut(&str) -> Vec<Outcome>,
+) -> &'s str {
+    let mut possible_words = possible_words.to_vec();
 
-    while possible_words.len() > 1 {
-        let guess = get_guess_word(&possible_words, words);
-        let outcome = get_outcome(&guess);
-        possible_words = filter_words(&possible_words, &guess, outcome);
+    loop {
+        match &possible_words[..] {
+            &[] => unreachable!("no possible words"),
+            &[s] => return s,
+            _ => {
+                let guess = get_guess_word(&possible_words, guessable_words);
+                let outcome = get_outcome(&guess);
+                possible_words = filter_words(&possible_words, &guess, outcome);
+            }
+        }
     }
-    possible_words.pop().unwrap()
-}
-
-lazy_static::lazy_static! {
-    static ref START_CACHE: Mutex<HashMap<u64, String>> = Mutex::new(HashMap::new());
 }
 
 fn get_guess_word<'s>(possible: &[&str], guessable: &[&'s str]) -> String {
-    if possible != guessable {
-        return calc_guess_word(possible, guessable);
+    let mut max_possible_lock = MAX_POSSIBLE.lock().unwrap();
+    let use_cache = match *max_possible_lock {
+        None => {
+            *max_possible_lock = Some(possible.len());
+            true
+        }
+        Some(l) if l <= possible.len() => {
+            *max_possible_lock = Some(possible.len());
+            true
+        }
+        Some(_) => false,
+    };
+    drop(max_possible_lock);
+
+    if use_cache {
+        let mut hasher = std::collections::hash_map::DefaultHasher::default();
+
+        possible.hash(&mut hasher);
+        guessable.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        match START_CACHE.lock().unwrap().get(&hash) {
+            Some(v) => return v.clone(),
+            None => {}
+        }
+
+        let word = calc_guess_word(possible, guessable);
+        START_CACHE.lock().unwrap().put(hash, word.to_string());
+        word.to_string()
+    } else {
+        calc_guess_word(possible, guessable).to_string()
     }
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::default();
-    guessable.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let mut cache_lock = START_CACHE.lock().unwrap();
-    cache_lock
-        .entry(hash)
-        .or_insert_with(|| calc_guess_word(possible, guessable).to_string())
-        .to_string()
 }
 
 fn calc_guess_word<'s>(possible_words: &[&str], guessable_words: &[&'s str]) -> String {
     guessable_words
-        .iter()
+        .par_iter()
+        .progress_with(if let Ok(_) = PROGRESS_LOCK.try_lock() {
+            ProgressBar::new(guessable_words.len() as u64)
+        } else {
+            ProgressBar::hidden()
+        })
         .min_by_key(|guessed_word| worst_bucket_size(guessed_word, possible_words))
         .unwrap()
         .to_string()
