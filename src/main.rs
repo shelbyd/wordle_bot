@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Word is: '{}'", word);
         },
         Command::PlayAll { out } => {
-            let mut file = OpenOptions::new().append(true).create(true).open(&out)?;
+            let file = Mutex::new(OpenOptions::new().append(true).create(true).open(&out)?);
 
             possible_words
                 .par_iter()
@@ -82,10 +82,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     assert_eq!(&word, secret);
                     (secret, guesses)
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
                 .try_for_each(|(secret, guesses)| {
-                    writeln!(&mut file, "{};{:?}", secret, guesses)
+                    writeln!(&mut file.lock().unwrap(), "{};{:?}", secret, guesses)
                 })?;
             Ok(())
         }
@@ -147,7 +145,7 @@ fn get_guess_word<'s>(possible: &[&str], guessable: &[&'s str]) -> String {
     }
 }
 
-fn calc_guess_word<'s>(possible_words: &[&str], guessable_words: &[&'s str]) -> String {
+fn calc_guess_word(possible_words: &[&str], guessable_words: &[&str]) -> String {
     guessable_words
         .par_iter()
         .progress_with(if let Ok(_) = PROGRESS_LOCK.try_lock() {
@@ -155,12 +153,33 @@ fn calc_guess_word<'s>(possible_words: &[&str], guessable_words: &[&'s str]) -> 
         } else {
             ProgressBar::hidden()
         })
-        .min_by_key(|guessed_word| worst_bucket_size(guessed_word, possible_words))
+        .min_by_key(|guessed_word| {
+            float_ord::FloatOrd(expected_score(guessed_word, possible_words))
+        })
         .unwrap()
         .to_string()
 }
 
-fn worst_bucket_size(guessed_word: &str, list: &[&str]) -> usize {
+fn expected_score(guessed: &str, possible: &[&str]) -> f64 {
+    let possible_prob = 1.0 / possible.len() as f64;
+    let possible_entropy = (-possible_prob * possible_prob.log2()) * possible.len() as f64;
+
+    let correct_prob = if possible.contains(&guessed) {
+        possible_prob
+    } else {
+        0.
+    };
+
+    correct_prob
+        + (1.0 - correct_prob)
+            * expected_score_from_entropy(possible_entropy - bucket_entropy(guessed, possible))
+}
+
+fn expected_score_from_entropy(entropy: f64) -> f64 {
+    1. + 0.56 * (entropy + 1.).ln() + 0.1 * entropy
+}
+
+fn bucket_entropy(guessed_word: &str, list: &[&str]) -> f64 {
     let mut outcome_count = HashMap::new();
 
     for secret_word in list {
@@ -169,7 +188,13 @@ fn worst_bucket_size(guessed_word: &str, list: &[&str]) -> usize {
             .or_insert(0) += 1;
     }
 
-    outcome_count.into_values().max().unwrap()
+    outcome_count
+        .into_values()
+        .map(|count| {
+            let prob = count as f64 / list.len() as f64;
+            -prob * prob.log2()
+        })
+        .sum()
 }
 
 fn get_outcome(guessed_word: &str, secret_word: &str) -> Vec<Outcome> {
